@@ -27,6 +27,7 @@ static const bool RUN_ENABLE_SDM = true;
 static const bool DUMP_FILE_SETTINGS = true;
 static const bool AUTO_DETECT_AUTH_KEY = true;
 static const bool NDEF_WRITE_REQUIRES_AUTH = true;
+static const bool DEBUG_TRY_BASELINE_VARIANT = false;
 static const char *FW_DEBUG_TAG = "SDM-1BAR-DIAG-v2";
 
 // Dynamic URL template with placeholders. NTAG424 SDM will mirror over these.
@@ -66,7 +67,7 @@ static const uint8_t POLICY_AR_W = 0xE;
 // SDM access-right bytes are policy dependent. Keep as explicit bytes.
 // Configure SDM MAC-related access to use key1.
 static const uint8_t POLICY_SDM_AR_B1 = 0xF1;
-static const uint8_t POLICY_SDM_AR_B2 = 0x11;
+static const uint8_t POLICY_SDM_AR_B2 = 0xE1;
 
 // SDM options: 0xC1 enables ASCII UID mirror + Read Counter mirror.
 static const uint8_t POLICY_SDM_OPTIONS = 0xC1;
@@ -566,25 +567,36 @@ static bool enableSdmForDynamicUrl(const char *url,
     // SDMMACInputOffset=SDMMACOffset.
     uint8_t spec2B_F1E1_InputEqMac[18] = {
             (uint8_t)(0x40 | (currentFileOption & 0x03)), currentAr1, currentAr2,
-            0xC1, 0xF1, 0xE1,
+            POLICY_SDM_OPTIONS, POLICY_SDM_AR_B1, POLICY_SDM_AR_B2,
             fileSettings[6], fileSettings[7], fileSettings[8],
             fileSettings[9], fileSettings[10], fileSettings[11],
             fileSettings[15], fileSettings[16], fileSettings[17],
             fileSettings[15], fileSettings[16], fileSettings[17]};
 
-            const Candidate candidates[] = {
-                {{0}, 3, NTAG424_COMM_MODE_FULL, "baseline no-SDM (diagnostic) + FULL"},
-                {{0}, 18, NTAG424_COMM_MODE_FULL, "spec 2B F1E1 UID+CTR+CMAC (MACInput=MACOffset) + FULL"},
-            };
+        Candidate runtimeCandidates[2] = {
+            {{0}, 0, NTAG424_COMM_MODE_FULL, nullptr},
+            {{0}, 0, NTAG424_COMM_MODE_FULL, nullptr}};
+        size_t runtimeCandidateCount = 0;
 
-    Candidate runtimeCandidates[sizeof(candidates) / sizeof(candidates[0])];
-    memcpy(runtimeCandidates, candidates, sizeof(candidates));
+        if (DEBUG_TRY_BASELINE_VARIANT) {
+        memcpy(runtimeCandidates[runtimeCandidateCount].payload, baselineNoSdm, sizeof(baselineNoSdm));
+        runtimeCandidates[runtimeCandidateCount].payloadLen = (uint8_t)sizeof(baselineNoSdm);
+        runtimeCandidates[runtimeCandidateCount].commMode = NTAG424_COMM_MODE_FULL;
+        runtimeCandidates[runtimeCandidateCount].name = "baseline no-SDM (diagnostic) + FULL";
+        ++runtimeCandidateCount;
+        }
 
-    memcpy(runtimeCandidates[0].payload, baselineNoSdm, sizeof(baselineNoSdm));
-    memcpy(runtimeCandidates[1].payload, spec2B_F1E1_InputEqMac, sizeof(spec2B_F1E1_InputEqMac));
+        memcpy(runtimeCandidates[runtimeCandidateCount].payload, spec2B_F1E1_InputEqMac,
+           sizeof(spec2B_F1E1_InputEqMac));
+        runtimeCandidates[runtimeCandidateCount].payloadLen =
+            (uint8_t)sizeof(spec2B_F1E1_InputEqMac);
+        runtimeCandidates[runtimeCandidateCount].commMode = NTAG424_COMM_MODE_FULL;
+        runtimeCandidates[runtimeCandidateCount].name =
+            "spec 2B F1E1 UID+CTR+CMAC (MACInput=MACOffset) + FULL";
+        ++runtimeCandidateCount;
 
     bool ok = false;
-    for (size_t c = 0; c < (sizeof(runtimeCandidates) / sizeof(runtimeCandidates[0])); ++c) {
+    for (size_t c = 0; c < runtimeCandidateCount; ++c) {
 
         Serial.print("Trying ChangeFileSettings variant: ");
         Serial.println(runtimeCandidates[c].name);
