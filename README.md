@@ -58,7 +58,6 @@ To change pins, update in `src/main.cpp`:
 ## Software Requirements
 - VS Code + PlatformIO extension (recommended)
 - or PlatformIO CLI
-- Python (for `py -m platformio ...` commands)
 
 ## Project Structure
 ```text
@@ -74,22 +73,22 @@ To change pins, update in `src/main.cpp`:
 Build:
 
 ```powershell
-py -m platformio run
+pio run
 ```
 
 Upload:
 
 ```powershell
-py -m platformio run -t upload --upload-port COM3
+pio run -t upload --upload-port COM3
 ```
 
 Open monitor:
 
 ```powershell
-py -m platformio device monitor --port COM3 -b 115200
+pio device monitor --port COM3 -b 115200
 ```
 
-If `pio` is already in PATH, you can use `pio run` / `pio device monitor`.
+If PlatformIO is installed via VS Code extension only, run commands from PlatformIO terminal.
 
 ## Configuration
 Main runtime flags in `src/main.cpp`:
@@ -139,11 +138,14 @@ Successful verify example shape:
 
 ## Troubleshooting
 ### `pio` command not found
-Use:
+Use one of these options:
 
 ```powershell
-py -m platformio run
+pio run
 ```
+
+- Open VS Code command palette and run PlatformIO: New Terminal.
+- Or install PlatformIO CLI globally and ensure pio is in PATH.
 
 ### Upload fails / COM busy
 - Close Serial Monitor before upload.
