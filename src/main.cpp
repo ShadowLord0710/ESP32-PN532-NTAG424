@@ -1,3 +1,16 @@
+/*
+ * ESP32 + PN532 + NTAG424 DNA SDM Provisioning Tool
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 ShadowLord0710
+ * 
+ * This project uses:
+ * - Adafruit PN532 NTAG424 Library
+ * - Arduino Core libraries
+ * - References NXP NTAG424 DNA specifications
+ * 
+ * See LICENSES.md for full attribution details
+ */
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>

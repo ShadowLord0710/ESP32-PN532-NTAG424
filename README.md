@@ -19,7 +19,7 @@ This project focuses on:
 - [Recommended Test Flow](#recommended-test-flow)
 - [Troubleshooting](#troubleshooting)
 - [Safety Notes](#safety-notes)
-- [References](#references)
+- [References & License](#references--license)
 
 ## What This Project Does
 - Detects NTAG424 DNA tag.
@@ -170,10 +170,24 @@ pio run
 - Do not enable key change on production batches before full test pass.
 - Keep a per-batch record of key map and file policy.
 
-## References
+## References & License
+
+**License**: This project is licensed under the MIT License. See [LICENSE](LICENSE) file for details.
+
+**Third-Party Dependencies**: See [LICENSES.md](LICENSES.md) for comprehensive attribution and license information for all libraries and documentation used.
+
+**Key References**:
 - PN532 NTAG424 library fork:
   - https://github.com/bitcoin-ring/Adafruit-PN532-NTAG424
 - PlatformIO:
   - https://platformio.org/
 - NXP AN12196 (NTAG 424 DNA features and hints)
-- NXP NT4H2421Gx datasheet
+  - Used for SDM specification details
+- NXP NT4H2421Gx datasheet (NTAG 424 DNA Type 2 Tag)
+  - Used for protocol and memory layout reference
+
+**Building on This Project**: When using or forking this code, ensure you:
+1. Retain the MIT LICENSE file
+2. Keep or reference LICENSES.md
+3. Maintain attribution to original authors
+4. Document any modifications or derivative works
