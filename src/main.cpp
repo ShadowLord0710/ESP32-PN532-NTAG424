@@ -24,11 +24,20 @@
 static const bool RUN_CHANGE_KEY = false;
 static const bool RUN_WRITE_DYNAMIC_URL = true;
 static const bool RUN_ENABLE_SDM = true;
-static const bool DUMP_FILE_SETTINGS = true;
-static const bool AUTO_DETECT_AUTH_KEY = true;
 static const bool NDEF_WRITE_REQUIRES_AUTH = true;
-static const bool DEBUG_TRY_BASELINE_VARIANT = false;
 static const char *FW_DEBUG_TAG = "SDM-1BAR-DIAG-v2";
+static const uint8_t AUTH_CMD_LIST[2] = {0x71, 0x77};
+static const uint8_t OP_MAX_RETRY = 3;
+static const uint16_t OP_RETRY_DELAY_MS = 80;
+
+enum ErrorCode {
+    E_NONE = 0,
+    E100_BUILD_NDEF = 100,
+    E110_AUTH = 110,
+    E120_WRITE_NDEF = 120,
+    E210_SDM_VERIFY = 210,
+    E300_KEY_CHANGE = 300
+};
 
 // Dynamic URL template with placeholders. NTAG424 SDM will mirror over these.
 static const char *DYNAMIC_URL_TEMPLATE =
@@ -136,42 +145,43 @@ static const uint8_t KEY3_NEW[16] = {
     0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00};
 
-struct AuthContext {
-    bool valid;
-    uint8_t keyNo;
-    uint8_t cmd;
-};
-
 static const uint8_t *getKeyByNo(uint8_t keyNo, bool useNewKeys) {
-    if (useNewKeys) {
-        if (keyNo == 0) {
-            return KEY0_NEW;
-        }
-        if (keyNo == 1) {
-            return KEY1_NEW;
-        }
-        if (keyNo == 2) {
-            return KEY2_NEW;
-        }
-        if (keyNo == 3) {
-            return KEY3_NEW;
-        }
+    if (keyNo > 3) {
         return nullptr;
     }
 
-    if (keyNo == 0) {
-        return KEY0_OLD;
+    static const uint8_t *const OLD_KEYS[4] = {
+            KEY0_OLD, KEY1_OLD, KEY2_OLD, KEY3_OLD};
+    static const uint8_t *const NEW_KEYS[4] = {
+            KEY0_NEW, KEY1_NEW, KEY2_NEW, KEY3_NEW};
+
+    return useNewKeys ? NEW_KEYS[keyNo] : OLD_KEYS[keyNo];
+}
+
+static void printStepLog(const uint8_t *uid, uint8_t uidLength,
+                         const char *step, uint8_t attempt,
+                         uint8_t maxAttempt, bool ok,
+                         ErrorCode code) {
+    Serial.print("[TAG uid=");
+    for (uint8_t i = 0; i < uidLength; ++i) {
+        if (uid[i] < 0x10) {
+            Serial.print('0');
+        }
+        Serial.print(uid[i], HEX);
     }
-    if (keyNo == 1) {
-        return KEY1_OLD;
+    Serial.print("] [STEP ");
+    Serial.print(step);
+    Serial.print("] [TRY ");
+    Serial.print(attempt);
+    Serial.print('/');
+    Serial.print(maxAttempt);
+    Serial.print("] [RESULT ");
+    Serial.print(ok ? "OK" : "FAIL");
+    if (!ok) {
+        Serial.print(":E");
+        Serial.print((int)code);
     }
-    if (keyNo == 2) {
-        return KEY2_OLD;
-    }
-    if (keyNo == 3) {
-        return KEY3_OLD;
-    }
-    return nullptr;
+    Serial.println(']');
 }
 
 static void printHexLine(const char *label, const uint8_t *buf, size_t len) {
@@ -219,11 +229,10 @@ static bool authenticateForPolicyKey(uint8_t keyNo, bool useNewKeys,
     Serial.print(" for ");
     Serial.println(reason);
 
-    const uint8_t authCmdList[2] = {0x71, 0x77};
-    for (size_t i = 0; i < 2; ++i) {
-        if (nfc.ntag424_Authenticate((uint8_t *)key, keyNo, authCmdList[i]) == 1) {
+    for (uint8_t cmd : AUTH_CMD_LIST) {
+        if (nfc.ntag424_Authenticate((uint8_t *)key, keyNo, cmd) == 1) {
             Serial.print("Authenticate OK with cmd 0x");
-            Serial.println(authCmdList[i], HEX);
+            Serial.println(cmd, HEX);
             return true;
         }
     }
@@ -232,60 +241,19 @@ static bool authenticateForPolicyKey(uint8_t keyNo, bool useNewKeys,
     return false;
 }
 
-static AuthContext detectAuthContext(bool useNewKeys) {
-    AuthContext ctx = {false, 0, 0};
-    const uint8_t authCmdList[2] = {0x71, 0x77};
-
-    for (uint8_t keyNo = 0; keyNo < 4; ++keyNo) {
-        const uint8_t *key = getKeyByNo(keyNo, useNewKeys);
-        if (!key) {
-            continue;
+static bool authenticateForPolicyKeyRetry(const uint8_t *uid,
+                                          uint8_t uidLength,
+                                          const char *step,
+                                          uint8_t keyNo,
+                                          bool useNewKeys) {
+    for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+        const bool ok = authenticateForPolicyKey(keyNo, useNewKeys, step);
+        printStepLog(uid, uidLength, step, attempt, OP_MAX_RETRY, ok, E110_AUTH);
+        if (ok) {
+            return true;
         }
-        for (size_t i = 0; i < 2; ++i) {
-            if (nfc.ntag424_Authenticate((uint8_t *)key, keyNo, authCmdList[i]) == 1) {
-                ctx.valid = true;
-                ctx.keyNo = keyNo;
-                ctx.cmd = authCmdList[i];
-                Serial.print("Detected auth key");
-                Serial.print(ctx.keyNo);
-                Serial.print(" cmd=0x");
-                Serial.println(ctx.cmd, HEX);
-                return ctx;
-            }
-        }
+        delay(OP_RETRY_DELAY_MS);
     }
-
-    Serial.println("Auto-detect auth key failed (key0..3, cmd 0x71/0x77).");
-    return ctx;
-}
-
-static bool authenticateForPolicyOrFallback(uint8_t policyKeyNo, bool useNewKeys,
-                                                                                        const char *reason, const AuthContext &fallback) {
-    if (authenticateForPolicyKey(policyKeyNo, useNewKeys, reason)) {
-        return true;
-    }
-
-    if (!fallback.valid || fallback.keyNo == policyKeyNo) {
-        Serial.println("Authenticate failed.");
-        return false;
-    }
-
-    Serial.print("Fallback authenticate key");
-    Serial.print(fallback.keyNo);
-    Serial.print(" for ");
-    Serial.println(reason);
-
-    const uint8_t *fallbackKey = getKeyByNo(fallback.keyNo, useNewKeys);
-    if (!fallbackKey) {
-        return false;
-    }
-
-    if (nfc.ntag424_Authenticate((uint8_t *)fallbackKey, fallback.keyNo, fallback.cmd) == 1) {
-        Serial.println("Fallback authenticate OK.");
-        return true;
-    }
-
-    Serial.println("Fallback authenticate failed.");
     return false;
 }
 
@@ -310,7 +278,7 @@ static size_t buildNdefUriRecord(const char *url, uint8_t uriIdentifier,
     const size_t ndefMsgLen = 5 + urlLen; // SR URI record header + payload
     const size_t totalLen = 2 + ndefMsgLen;
 
-    if (totalLen > outMax || ndefMsgLen > 0xFF) {
+    if (totalLen > outMax || ndefMsgLen > 0xFF || totalLen > 0xFF) {
         return 0;
     }
 
@@ -465,24 +433,32 @@ static size_t buildSdmFileSettingsForUrl(const char *url, uint8_t *out,
     return i;
 }
 
-static bool writeDynamicUrlNdef(const char *url) {
+static bool writeDynamicUrlNdefWithRetry(const uint8_t *uid,
+                                         uint8_t uidLength,
+                                         const char *url) {
     uint8_t ndef[320] = {0};
     const size_t ndefLen = buildNdefUriRecord(url, URI_IDENTIFIER, ndef, sizeof(ndef));
     if (ndefLen == 0) {
-        Serial.println("Failed to build NDEF payload.");
+        printStepLog(uid, uidLength, "NDEF_BUILD", 1, 1, false, E100_BUILD_NDEF);
         return false;
     }
+    printStepLog(uid, uidLength, "NDEF_BUILD", 1, 1, true, E_NONE);
 
-    Serial.print("Writing NDEF bytes: ");
-    Serial.println((int)ndefLen);
-    return nfc.ntag424_ISOUpdateBinary(ndef, (uint8_t)ndefLen);
+    for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+        const bool writeOk = nfc.ntag424_ISOUpdateBinary(ndef, (uint8_t)ndefLen);
+        printStepLog(uid, uidLength, "NDEF_WRITE", attempt, OP_MAX_RETRY, writeOk, E120_WRITE_NDEF);
+        if (writeOk) {
+            return true;
+        }
+        delay(OP_RETRY_DELAY_MS);
+    }
+    return false;
 }
 
-static bool verifySdmBitAfterChange(uint8_t verifyKeyNo, bool useNewKeys,
-                                                                        const AuthContext &fallback) {
+static bool verifySdmBitAfterChange(uint8_t verifyKeyNo, bool useNewKeys) {
     // After ChangeFileSettings the session may be invalid; always re-auth.
-    if (!authenticateForPolicyOrFallback(verifyKeyNo, useNewKeys,
-                                                                             "verify GetFileSettings", fallback)) {
+    if (!authenticateForPolicyKey(verifyKeyNo, useNewKeys,
+                                  "verify GetFileSettings")) {
         Serial.println("Re-auth before verify failed.");
         return false;
     }
@@ -518,8 +494,7 @@ static bool verifySdmBitAfterChange(uint8_t verifyKeyNo, bool useNewKeys,
 
 static bool enableSdmForDynamicUrl(const char *url,
                                                                      uint8_t verifyKeyNo,
-                                                                     bool useNewKeys,
-                                                                     const AuthContext &fallback) {
+                                                                     bool useNewKeys) {
     uint8_t currentFs[64] = {0};
     const uint8_t currentFsLen = nfc.ntag424_GetFileSettings(
             NDEF_FILE_NO, currentFs, NTAG424_COMM_MODE_MAC);
@@ -549,18 +524,7 @@ static bool enableSdmForDynamicUrl(const char *url,
     fileSettings[1] = currentAr1;
     fileSettings[2] = currentAr2;
 
-    if (DUMP_FILE_SETTINGS) {
-        dumpFileSettingsRaw("Before ChangeFileSettings");
-    }
-
-    struct Candidate {
-        uint8_t payload[24];
-        uint8_t payloadLen;
-        uint8_t commMode;
-        const char *name;
-    };
-
-    uint8_t baselineNoSdm[3] = {currentFileOption, currentAr1, currentAr2};
+    dumpFileSettingsRaw("Before ChangeFileSettings");
 
     // Proven working payload from AN12196 / NT4H2421Gx mapping.
     // SDMOptions=C1, SDMAccessRights=F1E1, UIDOffset, CtrOffset,
@@ -573,62 +537,28 @@ static bool enableSdmForDynamicUrl(const char *url,
             fileSettings[15], fileSettings[16], fileSettings[17],
             fileSettings[15], fileSettings[16], fileSettings[17]};
 
-        Candidate runtimeCandidates[2] = {
-            {{0}, 0, NTAG424_COMM_MODE_FULL, nullptr},
-            {{0}, 0, NTAG424_COMM_MODE_FULL, nullptr}};
-        size_t runtimeCandidateCount = 0;
+    Serial.println("Trying ChangeFileSettings variant: spec 2B F1E1 UID+CTR+CMAC (MACInput=MACOffset) + FULL");
+    printHexLine("FileSettings SDM: ", spec2B_F1E1_InputEqMac,
+                 sizeof(spec2B_F1E1_InputEqMac));
 
-        if (DEBUG_TRY_BASELINE_VARIANT) {
-        memcpy(runtimeCandidates[runtimeCandidateCount].payload, baselineNoSdm, sizeof(baselineNoSdm));
-        runtimeCandidates[runtimeCandidateCount].payloadLen = (uint8_t)sizeof(baselineNoSdm);
-        runtimeCandidates[runtimeCandidateCount].commMode = NTAG424_COMM_MODE_FULL;
-        runtimeCandidates[runtimeCandidateCount].name = "baseline no-SDM (diagnostic) + FULL";
-        ++runtimeCandidateCount;
-        }
+    const uint8_t respLen = nfc.ntag424_ChangeFileSettings(
+            NDEF_FILE_NO,
+            spec2B_F1E1_InputEqMac,
+            (uint8_t)sizeof(spec2B_F1E1_InputEqMac),
+            NTAG424_COMM_MODE_FULL);
 
-        memcpy(runtimeCandidates[runtimeCandidateCount].payload, spec2B_F1E1_InputEqMac,
-           sizeof(spec2B_F1E1_InputEqMac));
-        runtimeCandidates[runtimeCandidateCount].payloadLen =
-            (uint8_t)sizeof(spec2B_F1E1_InputEqMac);
-        runtimeCandidates[runtimeCandidateCount].commMode = NTAG424_COMM_MODE_FULL;
-        runtimeCandidates[runtimeCandidateCount].name =
-            "spec 2B F1E1 UID+CTR+CMAC (MACInput=MACOffset) + FULL";
-        ++runtimeCandidateCount;
+    Serial.print("ChangeFileSettings response len: ");
+    Serial.println(respLen);
 
-    bool ok = false;
-    for (size_t c = 0; c < runtimeCandidateCount; ++c) {
-
-        Serial.print("Trying ChangeFileSettings variant: ");
-        Serial.println(runtimeCandidates[c].name);
-        printHexLine("FileSettings SDM: ", runtimeCandidates[c].payload,
-                                 runtimeCandidates[c].payloadLen);
-
-        const uint8_t respLen = nfc.ntag424_ChangeFileSettings(
-                NDEF_FILE_NO,
-                runtimeCandidates[c].payload,
-                runtimeCandidates[c].payloadLen,
-                runtimeCandidates[c].commMode);
-
-        Serial.print("ChangeFileSettings response len: ");
-        Serial.println(respLen);
-
-        if (verifySdmBitAfterChange(verifyKeyNo, useNewKeys, fallback)) {
-            ok = true;
-            break;
-        }
-    }
+    const bool ok = verifySdmBitAfterChange(verifyKeyNo, useNewKeys);
 
     if (!ok) {
         Serial.println("All ChangeFileSettings variants failed to enable SDM.");
-        if (DUMP_FILE_SETTINGS) {
-            dumpFileSettingsRaw("After ChangeFileSettings");
-        }
+        dumpFileSettingsRaw("After ChangeFileSettings");
         return false;
     }
 
-    if (DUMP_FILE_SETTINGS) {
-        dumpFileSettingsRaw("After ChangeFileSettings");
-    }
+    dumpFileSettingsRaw("After ChangeFileSettings");
 
     return true;
 }
@@ -675,18 +605,26 @@ void loop() {
 
     printHexLine("Card UID: ", uid, uidLength);
     bool usingNewKeys = false;
-    AuthContext detectedAuth = {false, 0, 0};
-
-    if (AUTO_DETECT_AUTH_KEY) {
-        detectedAuth = detectAuthContext(usingNewKeys);
-    }
 
     if (RUN_CHANGE_KEY) {
-        if (!authenticateForPolicyOrFallback(POLICY_ADMIN_KEYNO, false, "key change", detectedAuth)) {
+        if (!authenticateForPolicyKeyRetry(uid, uidLength,
+                                           "KEY_CHANGE_AUTH",
+                                           POLICY_ADMIN_KEYNO,
+                                           false)) {
             delay(1500);
             return;
         }
-        if (!runChangeKeys()) {
+        bool keyChangeOk = false;
+        for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+            keyChangeOk = runChangeKeys();
+            printStepLog(uid, uidLength, "KEY_CHANGE", attempt, OP_MAX_RETRY,
+                         keyChangeOk, E300_KEY_CHANGE);
+            if (keyChangeOk) {
+                break;
+            }
+            delay(OP_RETRY_DELAY_MS);
+        }
+        if (!keyChangeOk) {
             Serial.println("Stop due to key change error.");
             delay(2000);
             return;
@@ -696,12 +634,15 @@ void loop() {
 
     if (RUN_WRITE_DYNAMIC_URL) {
         if (NDEF_WRITE_REQUIRES_AUTH &&
-            !authenticateForPolicyOrFallback(POLICY_NDEF_WRITE_KEYNO, usingNewKeys,
-                                                                                             "NDEF update", detectedAuth)) {
+            !authenticateForPolicyKeyRetry(uid, uidLength,
+                                           "NDEF_AUTH",
+                                           POLICY_NDEF_WRITE_KEYNO,
+                                           usingNewKeys)) {
             delay(1500);
             return;
         }
-        if (!writeDynamicUrlNdef(DYNAMIC_URL_TEMPLATE)) {
+        if (!writeDynamicUrlNdefWithRetry(uid, uidLength,
+                                          DYNAMIC_URL_TEMPLATE)) {
             Serial.println("Write dynamic URL failed.");
             delay(2000);
             return;
@@ -710,15 +651,26 @@ void loop() {
     }
 
     if (RUN_ENABLE_SDM) {
-        if (!authenticateForPolicyOrFallback(POLICY_FILE_SETTINGS_KEYNO, usingNewKeys,
-                                                                                         "ChangeFileSettings", detectedAuth)) {
+        if (!authenticateForPolicyKeyRetry(uid, uidLength,
+                                           "SDM_AUTH",
+                                           POLICY_FILE_SETTINGS_KEYNO,
+                                           usingNewKeys)) {
             delay(1500);
             return;
         }
-        if (!enableSdmForDynamicUrl(DYNAMIC_URL_TEMPLATE,
-                                                                POLICY_FILE_SETTINGS_KEYNO,
-                                                                usingNewKeys,
-                                                                detectedAuth)) {
+        bool sdmOk = false;
+        for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+            sdmOk = enableSdmForDynamicUrl(DYNAMIC_URL_TEMPLATE,
+                                           POLICY_FILE_SETTINGS_KEYNO,
+                                           usingNewKeys);
+            printStepLog(uid, uidLength, "SDM_ENABLE", attempt, OP_MAX_RETRY,
+                         sdmOk, sdmOk ? E_NONE : E210_SDM_VERIFY);
+            if (sdmOk) {
+                break;
+            }
+            delay(OP_RETRY_DELAY_MS);
+        }
+        if (!sdmOk) {
             Serial.println("Enable SDM failed.");
             delay(2000);
             return;
