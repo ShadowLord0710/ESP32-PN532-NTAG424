@@ -64,7 +64,6 @@ To change pins, update in `src/main.cpp`:
 .
 |- platformio.ini
 |- README.md
-|- README_PLATFORMIO_ESP32_SPI.md
 \- src/
    \- main.cpp
 ```
@@ -95,7 +94,12 @@ Main runtime flags in `src/main.cpp`:
 - `RUN_CHANGE_KEY`
 - `RUN_WRITE_DYNAMIC_URL`
 - `RUN_ENABLE_SDM`
-- `DUMP_FILE_SETTINGS`
+- `NDEF_WRITE_REQUIRES_AUTH`
+
+Reliability and operation controls:
+- `AUTH_CMD_LIST`
+- `OP_MAX_RETRY`
+- `OP_RETRY_DELAY_MS`
 
 Main policy settings:
 - `POLICY_ADMIN_KEYNO`
@@ -109,6 +113,24 @@ URL template:
 Keys:
 - `KEY0_OLD..KEY3_OLD`
 - `KEY0_NEW..KEY3_NEW`
+
+## Runtime Flow
+Current provisioning flow in `main.cpp`:
+1. Detect tag and validate NTAG424 DNA.
+2. Authenticate for each required step (with retry).
+3. Write dynamic URL NDEF payload (with retry).
+4. Enable SDM via `ChangeFileSettings`.
+5. Verify SDM is enabled by reading file settings.
+
+Structured one-line log format is used for key steps:
+- `[TAG uid=...] [STEP ...] [TRY x/y] [RESULT OK|FAIL:Exxx]`
+
+Error code mapping used in logs:
+- `E100` NDEF build failed
+- `E110` Authentication failed
+- `E120` NDEF write failed
+- `E210` SDM verification failed
+- `E300` Key change failed
 
 ## Verified SDM Profile
 This repo now includes a known-good SDM payload that has been validated in device logs.
