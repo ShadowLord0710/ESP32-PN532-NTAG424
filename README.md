@@ -43,8 +43,8 @@ Default pin mapping in code:
 | PN532 | ESP32 |
 |---|---|
 | SCK | GPIO18 |
-| MOSI | GPIO23 |
 | MISO | GPIO19 |
+| MOSI | GPIO23 |
 | SS | GPIO5 |
 | VCC | 3V3 |
 | GND | GND |

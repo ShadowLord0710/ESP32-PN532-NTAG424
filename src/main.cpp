@@ -25,10 +25,14 @@ static const bool RUN_CHANGE_KEY = false;
 static const bool RUN_WRITE_DYNAMIC_URL = true;
 static const bool RUN_ENABLE_SDM = true;
 static const bool NDEF_WRITE_REQUIRES_AUTH = true;
-static const char *FW_DEBUG_TAG = "SDM-1BAR-DIAG-v2";
+static const bool NDEF_WRITE_ALLOW_NO_AUTH_FALLBACK = true;
+static const bool NDEF_AUTH_TRY_ALL_KEYNOS = false;
+static const char *FW_DEBUG_TAG = "SDM-1BAR-DIAG-v5";
 static const uint8_t AUTH_CMD_LIST[2] = {0x71, 0x77};
 static const uint8_t OP_MAX_RETRY = 3;
+static const uint8_t SDM_ENABLE_MAX_RETRY = 1;
 static const uint16_t OP_RETRY_DELAY_MS = 80;
+static const uint32_t AUTH_FATAL_COOLDOWN_MS = 8000;
 
 enum ErrorCode {
     E_NONE = 0,
@@ -39,9 +43,12 @@ enum ErrorCode {
     E300_KEY_CHANGE = 300
 };
 
-// Dynamic URL template with placeholders. NTAG424 SDM will mirror over these.
+// Dynamic URL template.
+// Supported forms:
+// 1) Encrypted PICC: e=...&c=...
+// 2) ASCII SDM: uid=...&ctr=...&cmac=...
 static const char *DYNAMIC_URL_TEMPLATE =
-    "https://example.com/scan?uid=00000000000000&ctr=000000&cmac=0000000000000000";
+    "https://example.com/scan?e=00000000000000000000000000000000&c=0000000000000000";
 
 // URI identifier 0x00 means no prefix compression.
 static const uint8_t URI_IDENTIFIER = 0x00;
@@ -74,12 +81,23 @@ static const uint8_t POLICY_AR_R = 0xE;
 static const uint8_t POLICY_AR_W = 0xE;
 
 // SDM access-right bytes are policy dependent. Keep as explicit bytes.
-// Configure SDM MAC-related access to use key1.
-static const uint8_t POLICY_SDM_AR_B1 = 0xF1;
-static const uint8_t POLICY_SDM_AR_B2 = 0xE1;
+// B1: RFU(4) + SDMCtrRet key(4) = 0xF1 (counter retention on key1)
+// B2: SDMMetaRead key(4, high nibble) + SDMFileRead key(4, low nibble)
+//     Format: 0x(MetaReadKey)(FileReadKey)
+//     0x00 = key0+key0, 0x11 = key1+key1, 0x21 = key2 decrypt+key1 verify, etc.
+static const uint8_t POLICY_SDM_AR_B1_ASCII = 0xF1;
+static const uint8_t POLICY_SDM_AR_B1_ENC_PICC = 0xFF;
+static const uint8_t POLICY_SDM_AR_B2_ASCII = 0xE1;      // MetaRead=free (E), FileRead=key1 (1)
+// For e/c mode we only need MetaRead (for EncPICCData) + MAC.
+// Disable SDM file data read (low nibble F) to avoid requiring ENC file offsets.
+static const uint8_t POLICY_SDM_AR_B2_ENC_PICC = 0x0F;   // MetaRead=key0, FileRead=none
+static const uint8_t POLICY_SDM_AR_B2_ENC_PICC_FREE_META = 0xEF; // MetaRead=free, FileRead=none
+static const uint8_t POLICY_SDM_AR_B2_ENC_PICC_SPEC = 0xE1; // Spec-like fallback profile
 
-// SDM options: 0xC1 enables ASCII UID mirror + Read Counter mirror.
-static const uint8_t POLICY_SDM_OPTIONS = 0xC1;
+static const uint8_t POLICY_SDM_OPTIONS_ASCII = 0xC1;     // ASCII UID + counter mirror
+static const uint8_t POLICY_SDM_OPTIONS_ENC_PICC = 0xC5;  // Encrypted PICC + ASCII encoding
+static const uint8_t POLICY_SDM_OPTIONS_ENC_PICC_ALT1 = 0xC3; // Alternate bit layout used by some NTAG424 variants
+static const uint8_t POLICY_SDM_OPTIONS_ENC_PICC_ALT2 = 0xC7; // Alternate bit layout used by some NTAG424 variants
 
 // ============================================================================
 // PIN CONFIG
@@ -145,6 +163,15 @@ static const uint8_t KEY3_NEW[16] = {
     0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00};
 
+static uint16_t keyFingerprint16(const uint8_t key[16]) {
+    uint16_t acc = 0xA5A5;
+    for (uint8_t i = 0; i < 16; ++i) {
+        acc ^= (uint16_t)(key[i] << (i & 0x07));
+        acc = (uint16_t)((acc << 1) | (acc >> 15));
+    }
+    return acc;
+}
+
 static const uint8_t *getKeyByNo(uint8_t keyNo, bool useNewKeys) {
     if (keyNo > 3) {
         return nullptr;
@@ -208,7 +235,18 @@ static bool locateTag(uint8_t *uid, uint8_t *uidLength) {
         return false;
     }
 
-    if (!nfc.ntag424_isNTAG424()) {
+    // Some reads right after anti-collision can transiently fail type detect;
+    // retry briefly before concluding this is not an NTAG424 tag.
+    bool isNtag424 = false;
+    for (uint8_t i = 0; i < 3; ++i) {
+        if (nfc.ntag424_isNTAG424()) {
+            isNtag424 = true;
+            break;
+        }
+        delay(20);
+    }
+
+    if (!isNtag424) {
         Serial.println("Tag is not NTAG424.");
         return false;
     }
@@ -230,11 +268,15 @@ static bool authenticateForPolicyKey(uint8_t keyNo, bool useNewKeys,
     Serial.println(reason);
 
     for (uint8_t cmd : AUTH_CMD_LIST) {
-        if (nfc.ntag424_Authenticate((uint8_t *)key, keyNo, cmd) == 1) {
+        const int authResult = nfc.ntag424_Authenticate((uint8_t *)key, keyNo, cmd);
+        if (authResult == 1) {
             Serial.print("Authenticate OK with cmd 0x");
             Serial.println(cmd, HEX);
             return true;
         }
+        Serial.print("Authenticate cmd 0x");
+        Serial.print(cmd, HEX);
+        Serial.println(" failed.");
     }
 
     Serial.println("Authenticate failed.");
@@ -253,6 +295,27 @@ static bool authenticateForPolicyKeyRetry(const uint8_t *uid,
             return true;
         }
         delay(OP_RETRY_DELAY_MS);
+    }
+    return false;
+}
+
+static bool authenticateForAnyKeyNo(bool useNewKeys,
+                                    const char *reason,
+                                    uint8_t preferredKeyNo,
+                                    uint8_t &selectedKeyNo) {
+    // Try preferred key first, then scan remaining key numbers 0..3.
+    for (uint8_t phase = 0; phase < 2; ++phase) {
+        for (uint8_t keyNo = 0; keyNo <= 3; ++keyNo) {
+            if ((phase == 0 && keyNo != preferredKeyNo) ||
+                (phase == 1 && keyNo == preferredKeyNo)) {
+                continue;
+            }
+
+            if (authenticateForPolicyKey(keyNo, useNewKeys, reason)) {
+                selectedKeyNo = keyNo;
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -302,12 +365,11 @@ static uint32_t ndefUriPayloadOffset() {
     return 7;
 }
 
-static int findSubstrOffset(const char *haystack, const char *needle) {
-    const char *p = strstr(haystack, needle);
-    if (!p) {
-        return -1;
-    }
-    return (int)(p - haystack);
+// Locate placeholder values after '=' for ASCII SDM URL fields.
+static int findPlaceholderStart(const char *haystack, const char *key) {
+    const char *p = strstr(haystack, key);
+    if (!p) return -1;
+    return (int)(p - haystack) + (int)strlen(key);
 }
 
 static void put24le(uint8_t *dst, uint32_t value) {
@@ -386,56 +448,44 @@ static void dumpFileSettingsRaw(const char *title) {
     }
 }
 
-static size_t buildSdmFileSettingsForUrl(const char *url, uint8_t *out,
-                                                                                 size_t outMax) {
-    // Expected placeholders inside URL:
-    // uid=00000000000000 (14 hex), ctr=000000 (6 hex), cmac=0000000000000000 (16 hex)
-    const int uidPos = findSubstrOffset(url, "uid=");
-    const int ctrPos = findSubstrOffset(url, "ctr=");
-    const int cmacPos = findSubstrOffset(url, "cmac=");
+static bool buildSdmOffsetsFromUrl(const char *url,
+                                   bool &encryptedPiccMode,
+                                   uint32_t &uidOrEncPiccOffset,
+                                   uint32_t &ctrOffset,
+                                   uint32_t &cmacInputOffset,
+                                   uint32_t &cmacOffset) {
+    const int ePos = findPlaceholderStart(url, "e=");
+    const int cPos = findPlaceholderStart(url, "c=");
+    if (ePos >= 0 && cPos >= 0) {
+        const uint32_t base = ndefUriPayloadOffset();
+        encryptedPiccMode = true;
+        uidOrEncPiccOffset = base + (uint32_t)ePos;
+        ctrOffset = 0;
+        cmacInputOffset = uidOrEncPiccOffset;
+        cmacOffset = base + (uint32_t)cPos;
+        return true;
+    }
+
+    const int uidPos = findPlaceholderStart(url, "uid=");
+    const int ctrPos = findPlaceholderStart(url, "ctr=");
+    const int cmacPos = findPlaceholderStart(url, "cmac=");
     if (uidPos < 0 || ctrPos < 0 || cmacPos < 0) {
-        return 0;
+        return false;
     }
 
     const uint32_t base = ndefUriPayloadOffset();
-    const uint32_t uidOffset = base + (uint32_t)(uidPos + 4);
-    const uint32_t ctrOffset = base + (uint32_t)(ctrPos + 4);
-    const uint32_t cmacOffset = base + (uint32_t)(cmacPos + 5);
-    const uint32_t cmacInputOffset = uidOffset;
-
-    // This layout targets ASCII SDM with UID + ReadCounter mirroring + CMAC output.
-    // Byte meaning follows NTAG424 ChangeFileSettings SDM layout.
-    if (outMax < 18) {
-        return 0;
-    }
-
-    size_t i = 0;
-    out[i++] = 0x40; // FileOption: SDM enabled, plain communication
-    out[i++] = makeAccessByte(POLICY_AR_RW, POLICY_AR_CAR);
-    out[i++] = makeAccessByte(POLICY_AR_R, POLICY_AR_W);
-
-    out[i++] = POLICY_SDM_OPTIONS;
-    out[i++] = POLICY_SDM_AR_B1;
-    out[i++] = POLICY_SDM_AR_B2;
-
-    put24le(&out[i], uidOffset);
-    i += 3;
-
-    put24le(&out[i], ctrOffset);
-    i += 3;
-
-    put24le(&out[i], cmacInputOffset);
-    i += 3;
-
-    put24le(&out[i], cmacOffset);
-    i += 3;
-
-    return i;
+    encryptedPiccMode = false;
+    uidOrEncPiccOffset = base + (uint32_t)uidPos;
+    ctrOffset = base + (uint32_t)ctrPos;
+    cmacOffset = base + (uint32_t)cmacPos;
+    cmacInputOffset = uidOrEncPiccOffset;
+    return true;
 }
 
 static bool writeDynamicUrlNdefWithRetry(const uint8_t *uid,
                                          uint8_t uidLength,
-                                         const char *url) {
+                                         const char *url,
+                                         uint8_t maxAttempt) {
     uint8_t ndef[320] = {0};
     const size_t ndefLen = buildNdefUriRecord(url, URI_IDENTIFIER, ndef, sizeof(ndef));
     if (ndefLen == 0) {
@@ -444,9 +494,9 @@ static bool writeDynamicUrlNdefWithRetry(const uint8_t *uid,
     }
     printStepLog(uid, uidLength, "NDEF_BUILD", 1, 1, true, E_NONE);
 
-    for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+    for (uint8_t attempt = 1; attempt <= maxAttempt; ++attempt) {
         const bool writeOk = nfc.ntag424_ISOUpdateBinary(ndef, (uint8_t)ndefLen);
-        printStepLog(uid, uidLength, "NDEF_WRITE", attempt, OP_MAX_RETRY, writeOk, E120_WRITE_NDEF);
+        printStepLog(uid, uidLength, "NDEF_WRITE", attempt, maxAttempt, writeOk, E120_WRITE_NDEF);
         if (writeOk) {
             return true;
         }
@@ -512,55 +562,289 @@ static bool enableSdmForDynamicUrl(const char *url,
         currentAr2 = beforeParsed.ar2;
     }
 
-    uint8_t fileSettings[24] = {0};
-    const size_t fsLen = buildSdmFileSettingsForUrl(url, fileSettings, sizeof(fileSettings));
-    if (fsLen == 0) {
-        Serial.println("Failed to build SDM file settings (check URL placeholders).");
+    bool encryptedPiccMode = false;
+    uint32_t uidOrEncPiccOffset = 0, ctrOffset = 0, cmacInputOffset = 0, cmacOffset = 0;
+    if (!buildSdmOffsetsFromUrl(url,
+                                encryptedPiccMode,
+                                uidOrEncPiccOffset,
+                                ctrOffset,
+                                cmacInputOffset,
+                                cmacOffset)) {
+        Serial.println("Failed to build SDM offsets (check URL placeholders e/c or uid/ctr/cmac).");
         return false;
     }
-
-    // Keep comm mode bits and only force SDM bit. Reserved bits are kept clear.
-    fileSettings[0] = (uint8_t)((currentFileOption & 0x03) | 0x40);
-    fileSettings[1] = currentAr1;
-    fileSettings[2] = currentAr2;
 
     dumpFileSettingsRaw("Before ChangeFileSettings");
 
-    // Proven working payload from AN12196 / NT4H2421Gx mapping.
-    // SDMOptions=C1, SDMAccessRights=F1E1, UIDOffset, CtrOffset,
-    // SDMMACInputOffset=SDMMACOffset.
-    uint8_t spec2B_F1E1_InputEqMac[18] = {
-            (uint8_t)(0x40 | (currentFileOption & 0x03)), currentAr1, currentAr2,
-            POLICY_SDM_OPTIONS, POLICY_SDM_AR_B1, POLICY_SDM_AR_B2,
-            fileSettings[6], fileSettings[7], fileSettings[8],
-            fileSettings[9], fileSettings[10], fileSettings[11],
-            fileSettings[15], fileSettings[16], fileSettings[17],
-            fileSettings[15], fileSettings[16], fileSettings[17]};
+    // Diagnostic probe: verify ChangeFileSettings permission/session with a no-op
+    // payload before trying SDM-specific encodings.
+    {
+        uint8_t noOpPayload[3] = {currentFileOption, currentAr1, currentAr2};
+        Serial.println("Probe ChangeFileSettings: no-op payload (FileOption/AR unchanged)");
+        printHexLine("FileSettings probe: ", noOpPayload, sizeof(noOpPayload));
 
-    Serial.println("Trying ChangeFileSettings variant: spec 2B F1E1 UID+CTR+CMAC (MACInput=MACOffset) + FULL");
-    printHexLine("FileSettings SDM: ", spec2B_F1E1_InputEqMac,
-                 sizeof(spec2B_F1E1_InputEqMac));
+        const uint8_t probeLen = nfc.ntag424_ChangeFileSettings(
+                NDEF_FILE_NO,
+                noOpPayload,
+                (uint8_t)sizeof(noOpPayload),
+                NTAG424_COMM_MODE_FULL);
+        Serial.print("Probe ChangeFileSettings response len: ");
+        Serial.println(probeLen);
+        if (probeLen == 0) {
+            Serial.println("Probe transport failure (len=0). Aborting this SDM attempt.");
+            return false;
+        }
 
-    const uint8_t respLen = nfc.ntag424_ChangeFileSettings(
-            NDEF_FILE_NO,
-            spec2B_F1E1_InputEqMac,
-            (uint8_t)sizeof(spec2B_F1E1_InputEqMac),
-            NTAG424_COMM_MODE_FULL);
-
-    Serial.print("ChangeFileSettings response len: ");
-    Serial.println(respLen);
-
-    const bool ok = verifySdmBitAfterChange(verifyKeyNo, useNewKeys);
-
-    if (!ok) {
-        Serial.println("All ChangeFileSettings variants failed to enable SDM.");
-        dumpFileSettingsRaw("After ChangeFileSettings");
-        return false;
+        // Re-auth immediately so subsequent reads/writes start a fresh session.
+        if (!authenticateForPolicyKey(verifyKeyNo, useNewKeys,
+                                      "post-probe re-auth")) {
+            Serial.println("Post-probe re-auth failed.");
+            return false;
+        }
     }
 
-    dumpFileSettingsRaw("After ChangeFileSettings");
+    if (encryptedPiccMode) {
+        // Some NTAG424 variants reject one specific SDM layout with 91 9E.
+        // Try a small set of known-compatible C5 payload encodings and stop
+        // at the first one that verifies FileOption bit6 as ON.
+        uint8_t payloadA[18] = {0}; // includes MAC input offset
+        payloadA[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        payloadA[1] = currentAr1;
+        payloadA[2] = currentAr2;
+        payloadA[3] = POLICY_SDM_OPTIONS_ENC_PICC;
+        payloadA[4] = POLICY_SDM_AR_B1_ENC_PICC;
+        payloadA[5] = POLICY_SDM_AR_B2_ENC_PICC;
+        put24le(&payloadA[6], uidOrEncPiccOffset);
+        put24le(&payloadA[9], cmacInputOffset);
+        put24le(&payloadA[12], cmacOffset);
 
-    return true;
+        uint8_t payloadB[15] = {0}; // compact layout without explicit MAC input offset
+        payloadB[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        payloadB[1] = currentAr1;
+        payloadB[2] = currentAr2;
+        payloadB[3] = POLICY_SDM_OPTIONS_ENC_PICC;
+        payloadB[4] = POLICY_SDM_AR_B1_ENC_PICC;
+        payloadB[5] = POLICY_SDM_AR_B2_ENC_PICC;
+        put24le(&payloadB[6], uidOrEncPiccOffset);
+        put24le(&payloadB[9], cmacOffset);
+
+        uint8_t payloadC[18] = {0}; // fallback for tags that require retained ctr key nibble
+        memcpy(payloadC, payloadA, sizeof(payloadA));
+        payloadC[4] = POLICY_SDM_AR_B1_ASCII;
+
+        uint8_t payloadD[18] = {0}; // fallback with free MetaRead
+        memcpy(payloadD, payloadA, sizeof(payloadA));
+        payloadD[5] = POLICY_SDM_AR_B2_ENC_PICC_FREE_META;
+
+        uint8_t payloadE[18] = {0}; // free MetaRead + retained ctr key nibble
+        memcpy(payloadE, payloadC, sizeof(payloadC));
+        payloadE[5] = POLICY_SDM_AR_B2_ENC_PICC_FREE_META;
+
+        uint8_t payloadF[18] = {0}; // alt SDMOptions profile with same offsets
+        memcpy(payloadF, payloadA, sizeof(payloadA));
+        payloadF[3] = POLICY_SDM_OPTIONS_ENC_PICC_ALT1;
+
+        uint8_t payloadG[18] = {0}; // second alt SDMOptions profile
+        memcpy(payloadG, payloadA, sizeof(payloadA));
+        payloadG[3] = POLICY_SDM_OPTIONS_ENC_PICC_ALT2;
+
+        // Spec-like 4-offset layouts for encrypted mode.
+        uint8_t payloadH[18] = {0};
+        payloadH[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        payloadH[1] = currentAr1;
+        payloadH[2] = currentAr2;
+        payloadH[3] = POLICY_SDM_OPTIONS_ENC_PICC;
+        payloadH[4] = POLICY_SDM_AR_B1_ASCII;
+        payloadH[5] = POLICY_SDM_AR_B2_ENC_PICC_SPEC;
+        put24le(&payloadH[6], 0);                  // slot#1
+        put24le(&payloadH[9], uidOrEncPiccOffset); // slot#2
+        put24le(&payloadH[12], cmacOffset);        // slot#3
+        put24le(&payloadH[15], cmacOffset);        // slot#4
+
+        uint8_t payloadI[18] = {0};
+        payloadI[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        payloadI[1] = currentAr1;
+        payloadI[2] = currentAr2;
+        payloadI[3] = POLICY_SDM_OPTIONS_ENC_PICC;
+        payloadI[4] = POLICY_SDM_AR_B1_ASCII;
+        payloadI[5] = POLICY_SDM_AR_B2_ENC_PICC_SPEC;
+        put24le(&payloadI[6], uidOrEncPiccOffset); // slot#1
+        put24le(&payloadI[9], 0);                  // slot#2
+        put24le(&payloadI[12], cmacOffset);        // slot#3
+        put24le(&payloadI[15], cmacOffset);        // slot#4
+
+        uint8_t payloadJ[18] = {0};
+        memcpy(payloadJ, payloadH, sizeof(payloadH));
+        payloadJ[3] = POLICY_SDM_OPTIONS_ENC_PICC_ALT1;
+
+        uint8_t payloadK[18] = {0};
+        memcpy(payloadK, payloadH, sizeof(payloadH));
+        payloadK[3] = POLICY_SDM_OPTIONS_ENC_PICC_ALT2;
+        payloadK[4] = POLICY_SDM_AR_B1_ENC_PICC;
+
+        // Alternate offset basis for tags that interpret offsets from NDEF payload
+        // start without the 2-byte NLEN prefix.
+        const uint32_t uidOrEncPiccOffsetNoNlen =
+                (uidOrEncPiccOffset >= 2) ? (uidOrEncPiccOffset - 2) : uidOrEncPiccOffset;
+        const uint32_t cmacInputOffsetNoNlen =
+                (cmacInputOffset >= 2) ? (cmacInputOffset - 2) : cmacInputOffset;
+        const uint32_t cmacOffsetNoNlen =
+                (cmacOffset >= 2) ? (cmacOffset - 2) : cmacOffset;
+
+        uint8_t payloadL[18] = {0};
+        memcpy(payloadL, payloadA, sizeof(payloadA));
+        put24le(&payloadL[6], uidOrEncPiccOffsetNoNlen);
+        put24le(&payloadL[9], cmacInputOffsetNoNlen);
+        put24le(&payloadL[12], cmacOffsetNoNlen);
+
+        uint8_t payloadM[15] = {0};
+        memcpy(payloadM, payloadB, sizeof(payloadB));
+        put24le(&payloadM[6], uidOrEncPiccOffsetNoNlen);
+        put24le(&payloadM[9], cmacOffsetNoNlen);
+
+        // Spec-based encrypted e/c profiles from NTAG424 docs:
+        // - SDMOptions C1 profile
+        // - SDMFileRead key must not be F for encrypted SDM flow
+        // - Use PICCDataOffset + SDMMACOffset + SDMMACInputOffset
+        uint8_t payloadN[15] = {0};
+        payloadN[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        payloadN[1] = currentAr1;
+        payloadN[2] = currentAr2;
+        payloadN[3] = 0xC1; // spec-style SDM options profile
+        payloadN[4] = 0xF1;
+        payloadN[5] = 0x01; // MetaRead=key0, FileRead=key1
+        put24le(&payloadN[6], uidOrEncPiccOffset); // ENC PICC data offset
+        put24le(&payloadN[9], cmacOffset);         // SDMMAC offset
+        put24le(&payloadN[12], cmacOffset);        // empty MAC input region
+
+        uint8_t payloadO[15] = {0};
+        memcpy(payloadO, payloadN, sizeof(payloadN));
+        payloadO[5] = 0x11; // MetaRead=key1, FileRead=key1
+
+        uint8_t payloadP[15] = {0};
+        memcpy(payloadP, payloadN, sizeof(payloadN));
+        payloadP[5] = 0x21; // MetaRead=key2, FileRead=key1 (AN12196 style)
+
+        uint8_t payloadQ[15] = {0};
+        memcpy(payloadQ, payloadN, sizeof(payloadN));
+        put24le(&payloadQ[12], uidOrEncPiccOffset); // MAC input starts at ENC PICC data
+
+        uint8_t payloadR[15] = {0};
+        memcpy(payloadR, payloadN, sizeof(payloadN));
+        put24le(&payloadR[6], uidOrEncPiccOffsetNoNlen);
+        put24le(&payloadR[9], cmacOffsetNoNlen);
+        put24le(&payloadR[12], cmacOffsetNoNlen);
+
+        uint8_t payloadS[15] = {0};
+        memcpy(payloadS, payloadQ, sizeof(payloadQ));
+        put24le(&payloadS[6], uidOrEncPiccOffsetNoNlen);
+        put24le(&payloadS[9], cmacOffsetNoNlen);
+        put24le(&payloadS[12], uidOrEncPiccOffsetNoNlen);
+
+        const uint8_t *candidatePayloads[19] = {
+            payloadN, payloadO, payloadP, payloadQ, payloadR, payloadS,
+            payloadA, payloadB, payloadC, payloadD, payloadE,
+            payloadF, payloadG, payloadH, payloadI, payloadJ, payloadK,
+            payloadL, payloadM
+        };
+        const uint8_t candidateLens[19] = {
+            sizeof(payloadN), sizeof(payloadO), sizeof(payloadP), sizeof(payloadQ), sizeof(payloadR), sizeof(payloadS),
+            sizeof(payloadA), sizeof(payloadB), sizeof(payloadC), sizeof(payloadD), sizeof(payloadE),
+            sizeof(payloadF), sizeof(payloadG), sizeof(payloadH), sizeof(payloadI), sizeof(payloadJ), sizeof(payloadK),
+            sizeof(payloadL), sizeof(payloadM)
+        };
+        const char *candidateNames[19] = {
+            "SPEC variant N (15B, Opt=C1, B1=F1, B2=01, slots=E,C,C)",
+            "SPEC variant O (15B, Opt=C1, B1=F1, B2=11, slots=E,C,C)",
+            "SPEC variant P (15B, Opt=C1, B1=F1, B2=21, slots=E,C,C)",
+            "SPEC variant Q (15B, Opt=C1, B1=F1, B2=01, slots=E,C,E)",
+            "SPEC variant R (15B, Opt=C1, B1=F1, B2=01, no-NLEN, slots=E,C,C)",
+            "SPEC variant S (15B, Opt=C1, B1=F1, B2=01, no-NLEN, slots=E,C,E)",
+            "C5 variant A (18B, B1=FF, B2=0F, with MAC input)",
+            "C5 variant B (15B, B1=FF, B2=0F, compact)",
+            "C5 variant C (18B, B1=F1, B2=0F, with MAC input)",
+            "C5 variant D (18B, B1=FF, B2=EF, with MAC input)",
+            "C5 variant E (18B, B1=F1, B2=EF, with MAC input)",
+            "ALT variant F (18B, Opt=C3, B1=FF, B2=0F)",
+            "ALT variant G (18B, Opt=C7, B1=FF, B2=0F)",
+            "SPEC variant H (18B, Opt=C5, B1=F1, B2=E1, slots=0,E,C,C)",
+            "SPEC variant I (18B, Opt=C5, B1=F1, B2=E1, slots=E,0,C,C)",
+            "SPEC variant J (18B, Opt=C3, B1=F1, B2=E1, slots=0,E,C,C)",
+            "SPEC variant K (18B, Opt=C7, B1=FF, B2=E1, slots=0,E,C,C)",
+            "C5 variant L (18B, A-style offsets without NLEN)",
+            "C5 variant M (15B, B-style offsets without NLEN)"
+        };
+
+        for (uint8_t i = 0; i < 19; ++i) {
+            Serial.print("Requesting ChangeFileSettings: ");
+            Serial.println(candidateNames[i]);
+            printHexLine("FileSettings SDM: ", candidatePayloads[i], candidateLens[i]);
+
+            const uint8_t respLen = nfc.ntag424_ChangeFileSettings(
+                    NDEF_FILE_NO,
+                    (uint8_t *)candidatePayloads[i],
+                    candidateLens[i],
+                    NTAG424_COMM_MODE_FULL);
+
+            Serial.print("ChangeFileSettings response len: ");
+            Serial.println(respLen);
+
+            // PN532/transport failure (e.g. D5 41 0B): abort this attempt and
+            // require a fresh tap to avoid cascading auth/session errors.
+            if (respLen == 0) {
+                Serial.println("ChangeFileSettings transport failure (len=0). Aborting this SDM attempt.");
+                return false;
+            }
+
+            const bool ok = verifySdmBitAfterChange(verifyKeyNo, useNewKeys);
+            if (ok) {
+                dumpFileSettingsRaw("After ChangeFileSettings (success)");
+                return true;
+            }
+
+            Serial.println("ChangeFileSettings verification failed.");
+            dumpFileSettingsRaw("After ChangeFileSettings (failed)");
+        }
+
+        return false;
+    } else {
+        uint8_t sdmPayload[18] = {0};
+        sdmPayload[0] = (uint8_t)(0x40 | (currentFileOption & 0x03));
+        sdmPayload[1] = currentAr1;
+        sdmPayload[2] = currentAr2;
+
+        // ASCII payload (18 bytes):
+        // [FileOption|AR1|AR2|SDMOptions|SDMCtrRet|Meta+FileRead|UIDOff(3)|CtrOff(3)|MacInputOff(3)|MacOff(3)]
+        sdmPayload[3] = POLICY_SDM_OPTIONS_ASCII;
+        sdmPayload[4] = POLICY_SDM_AR_B1_ASCII;
+        sdmPayload[5] = POLICY_SDM_AR_B2_ASCII;
+        put24le(&sdmPayload[6], uidOrEncPiccOffset);
+        put24le(&sdmPayload[9], ctrOffset);
+        put24le(&sdmPayload[12], cmacInputOffset);
+        put24le(&sdmPayload[15], cmacOffset);
+        Serial.println("Requesting ChangeFileSettings: ASCII SDM (C1) + F1E1 profile");
+        printHexLine("FileSettings SDM: ", sdmPayload,
+                     sizeof(sdmPayload));
+
+        const uint8_t respLen = nfc.ntag424_ChangeFileSettings(
+                NDEF_FILE_NO,
+                sdmPayload,
+                (uint8_t)sizeof(sdmPayload),
+                NTAG424_COMM_MODE_FULL);
+
+        Serial.print("ChangeFileSettings response len: ");
+        Serial.println(respLen);
+
+        const bool ok = verifySdmBitAfterChange(verifyKeyNo, useNewKeys);
+        if (!ok) {
+            Serial.println("ChangeFileSettings verification failed.");
+            dumpFileSettingsRaw("After ChangeFileSettings (failed)");
+            return false;
+        }
+
+        dumpFileSettingsRaw("After ChangeFileSettings (success)");
+        return true;
+    }
 }
 
 void setup() {
@@ -568,6 +852,9 @@ void setup() {
     while (!Serial) {
         delay(10);
     }
+
+    Serial.print("KEY0_OLD fingerprint16=0x");
+    Serial.println(keyFingerprint16(KEY0_OLD), HEX);
 
     Serial.println();
     Serial.println("=== ESP32 PN532 NTAG424 Provisioning ===");
@@ -595,6 +882,10 @@ void setup() {
 }
 
 void loop() {
+    static uint8_t lastBlockedUid[7] = {0};
+    static uint8_t lastBlockedUidLen = 0;
+    static uint32_t lastBlockedAtMs = 0;
+
     uint8_t uid[7] = {0};
     uint8_t uidLength = 0;
 
@@ -604,6 +895,20 @@ void loop() {
     }
 
     printHexLine("Card UID: ", uid, uidLength);
+
+    if (lastBlockedUidLen == uidLength &&
+        uidLength > 0 &&
+        memcmp(lastBlockedUid, uid, uidLength) == 0) {
+        const uint32_t elapsed = millis() - lastBlockedAtMs;
+        if (elapsed < AUTH_FATAL_COOLDOWN_MS) {
+            Serial.print("Skip same UID during cooldown (ms left=");
+            Serial.print((uint32_t)(AUTH_FATAL_COOLDOWN_MS - elapsed));
+            Serial.println(").");
+            delay(300);
+            return;
+        }
+    }
+
     bool usingNewKeys = false;
 
     if (RUN_CHANGE_KEY) {
@@ -633,16 +938,81 @@ void loop() {
     }
 
     if (RUN_WRITE_DYNAMIC_URL) {
-        if (NDEF_WRITE_REQUIRES_AUTH &&
-            !authenticateForPolicyKeyRetry(uid, uidLength,
-                                           "NDEF_AUTH",
-                                           POLICY_NDEF_WRITE_KEYNO,
-                                           usingNewKeys)) {
-            delay(1500);
-            return;
+        uint8_t ndefWriteKeyNo = POLICY_NDEF_WRITE_KEYNO;
+        bool ndefAuthOk = true;
+        if (NDEF_WRITE_REQUIRES_AUTH) {
+            if (NDEF_AUTH_TRY_ALL_KEYNOS) {
+                for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+                    ndefAuthOk = authenticateForAnyKeyNo(usingNewKeys,
+                                                         "NDEF_AUTH",
+                                                         POLICY_NDEF_WRITE_KEYNO,
+                                                         ndefWriteKeyNo);
+                    printStepLog(uid, uidLength, "NDEF_AUTH", attempt, OP_MAX_RETRY,
+                                 ndefAuthOk, E110_AUTH);
+                    if (ndefAuthOk) {
+                        if (ndefWriteKeyNo != POLICY_NDEF_WRITE_KEYNO) {
+                            Serial.print("NDEF auth auto-selected key");
+                            Serial.println(ndefWriteKeyNo);
+                        }
+                        break;
+                    }
+                    delay(OP_RETRY_DELAY_MS);
+                }
+            } else {
+                ndefAuthOk = authenticateForPolicyKeyRetry(uid, uidLength,
+                                                           "NDEF_AUTH",
+                                                           POLICY_NDEF_WRITE_KEYNO,
+                                                           usingNewKeys);
+            }
+            if (!ndefAuthOk) {
+                if (!NDEF_WRITE_ALLOW_NO_AUTH_FALLBACK) {
+                    Serial.println("Stop provisioning for this tag: NDEF auth failed on all configured keys.");
+                    Serial.println("Set correct AES keys (KEY*_OLD_HEX) before retrying.");
+                    memcpy(lastBlockedUid, uid, uidLength);
+                    lastBlockedUidLen = uidLength;
+                    lastBlockedAtMs = millis();
+                    delay(1500);
+                    return;
+                }
+                Serial.println("All key0..key3 auth attempts failed for NDEF_AUTH.");
+                Serial.println("Likely cause: tag keys are no longer default 00..00 or wrong key set is configured.");
+                Serial.println("NDEF_AUTH failed; trying NDEF write without auth fallback.");
+            }
         }
-        if (!writeDynamicUrlNdefWithRetry(uid, uidLength,
-                                          DYNAMIC_URL_TEMPLATE)) {
+
+        bool ndefWriteOk = false;
+        const uint8_t ndefWriteAttemptMax = ndefAuthOk ? OP_MAX_RETRY : 1;
+        for (uint8_t attempt = 1; attempt <= ndefWriteAttemptMax; ++attempt) {
+            if (NDEF_WRITE_REQUIRES_AUTH && ndefAuthOk) {
+                const bool writeAuthOk = authenticateForPolicyKey(
+                        ndefWriteKeyNo,
+                        usingNewKeys,
+                        "NDEF_WRITE_AUTH");
+                printStepLog(uid, uidLength, "NDEF_WRITE_AUTH", attempt,
+                             ndefWriteAttemptMax, writeAuthOk, E110_AUTH);
+                if (!writeAuthOk) {
+                    delay(OP_RETRY_DELAY_MS);
+                    continue;
+                }
+            }
+
+            ndefWriteOk = writeDynamicUrlNdefWithRetry(uid, uidLength,
+                                                       DYNAMIC_URL_TEMPLATE,
+                                                       1);
+            if (ndefWriteOk) {
+                break;
+            }
+            delay(OP_RETRY_DELAY_MS);
+        }
+
+        if (!ndefWriteOk && NDEF_WRITE_ALLOW_NO_AUTH_FALLBACK) {
+            Serial.println("NDEF write still failing after auth attempts; trying plain write fallback.");
+            ndefWriteOk = writeDynamicUrlNdefWithRetry(uid, uidLength,
+                                                       DYNAMIC_URL_TEMPLATE,
+                                                       1);
+        }
+
+        if (!ndefWriteOk) {
             Serial.println("Write dynamic URL failed.");
             delay(2000);
             return;
@@ -658,24 +1028,23 @@ void loop() {
             delay(1500);
             return;
         }
+
         bool sdmOk = false;
-        for (uint8_t attempt = 1; attempt <= OP_MAX_RETRY; ++attempt) {
+        for (uint8_t attempt = 1; attempt <= SDM_ENABLE_MAX_RETRY; ++attempt) {
             sdmOk = enableSdmForDynamicUrl(DYNAMIC_URL_TEMPLATE,
                                            POLICY_FILE_SETTINGS_KEYNO,
                                            usingNewKeys);
-            printStepLog(uid, uidLength, "SDM_ENABLE", attempt, OP_MAX_RETRY,
-                         sdmOk, sdmOk ? E_NONE : E210_SDM_VERIFY);
-            if (sdmOk) {
-                break;
-            }
+            printStepLog(uid, uidLength, "SDM_ENABLE", attempt, SDM_ENABLE_MAX_RETRY,
+                         sdmOk, E210_SDM_VERIFY);
+            if (sdmOk) break;
             delay(OP_RETRY_DELAY_MS);
         }
+
         if (!sdmOk) {
             Serial.println("Enable SDM failed.");
             delay(2000);
             return;
         }
-        Serial.println("Enable SDM OK.");
     }
 
     Serial.println("Provision flow done. Remove and tap again for a new run.");
